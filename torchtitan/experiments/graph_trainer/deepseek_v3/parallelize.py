@@ -115,6 +115,11 @@ def parallelize_deepseekv3(
         )
         maybe_enable_async_tp(parallelism, compile_config, parallel_dims.get_mesh("tp"))
 
+    # Wire hybridep comm_backend through to apply_moe_ep_tp
+    comm_backend = parallelism.expert_parallel_comm_backend
+    if comm_backend == "hybridep":
+        from torchtitan.distributed.deepep import hybridep  # noqa: F401
+
     if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
         apply_moe_ep_tp(
             model,
@@ -122,6 +127,8 @@ def parallelize_deepseekv3(
             ep_mesh=parallel_dims.get_optional_mesh("ep"),
             etp_mesh=parallel_dims.get_optional_mesh("etp"),
             ep_etp_mesh=parallel_dims.get_optional_mesh(["ep", "etp"]),
+            comm_backend=comm_backend,
+            hybridep_non_blocking_expert_capacity_factor=parallelism.hybridep_non_blocking_expert_capacity_factor,
         )
 
     if ac_config.mode != "none":
@@ -188,6 +195,32 @@ def parallelize_deepseekv3(
 
         logger.info(
             "Applied Data Parallel (simple_fsdp) (dp mode=%s) to the model", dp_mode
+        )
+
+    # Pre-initialize HybridEP buffer before AOT tracing. get_buffer() creates
+    # a pybind11 HybridEPBuffer which Dynamo cannot trace, so dispatch_tokens()
+    # guards it with torch.compiler.is_compiling(). The compiled graph calls
+    # the custom op directly (not dispatch_tokens), so the buffer must exist
+    # before the first real forward. We initialize here because get_buffer()
+    # needs the ProcessGroup, hidden_dim, and num_tokens which are only
+    # available at the parallelize call site.
+    if comm_backend == "hybridep" and parallel_dims.ep_enabled:
+        from torchtitan.distributed.deepep.hybridep import get_buffer
+
+        ep_group = parallel_dims.get_mesh("ep").get_group()
+        num_experts = model.config.layer.moe.num_experts
+        num_local_experts = num_experts // parallel_dims.ep
+        hidden_dim = model.config.dim
+        num_tokens = training.local_batch_size * training.seq_len
+        get_buffer(
+            group=ep_group,
+            hidden_dim=hidden_dim,
+            num_tokens=num_tokens,
+            num_local_experts=num_local_experts,
+        )
+        logger.info(
+            f"Pre-initialized HybridEP buffer (hidden_dim={hidden_dim}, "
+            f"num_tokens={num_tokens}, num_local_experts={num_local_experts})"
         )
 
     # Apply compilation based on mode
