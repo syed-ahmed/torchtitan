@@ -34,8 +34,8 @@ jobs:
     with:
       runner: linux.aws.h100.8
       gpu-arch-type: cuda
-      gpu-arch-version: "13.0"
-      docker-image: torchtitan-ubuntu-20.04-clang12
+      gpu-arch-version: "13.2"
+      docker-image: nvidia/cuda:13.2.1-cudnn-devel-ubuntu22.04
       repository: pytorch/torchtitan
       upload-artifact: outputs
       timeout: 45
@@ -53,11 +53,27 @@ jobs:
         pip config --user set global.progress_bar off
 
         python -m pip install --force-reinstall --pre \
-          torch --index-url https://download.pytorch.org/whl/nightly/cu130
+          torch --index-url https://download.pytorch.org/whl/nightly/cu132
         python -m pip install torchdata==0.12.0.dev20260327 --extra-index-url https://download.pytorch.org/whl/nightly/cpu
 
         sudo mkdir -p "$RUNNER_TEMP/artifacts-to-be-uploaded"
         sudo chown -R $(id -u):$(id -g) "$RUNNER_TEMP/artifacts-to-be-uploaded"
+
+        # Dependencies for DeepEP compilation (NVSHMEM needs libcudacxx, IB headers).
+        sudo apt-get update -qq && sudo apt-get install -y -qq libibverbs-dev librdmacm-dev rdma-core > /dev/null 2>&1
+        # CCCL headers live under include/cccl/ in CUDA 13+ — symlink so
+        # NVSHMEM's #include "cuda/std/tuple" resolves correctly.
+        ln -sf /usr/local/cuda/include/cccl/cuda /usr/local/cuda/include/cuda 2>/dev/null || true
+
+        # Install DeepEP for HybridEP integration test.
+        # Pinned to a known-good commit on the hybrid-ep branch to avoid
+        # breakage from upstream changes. Update the commit hash when
+        # upgrading to a newer DeepEP version.
+        DEEPEP_COMMIT=1b8f467
+        git clone --branch hybrid-ep https://github.com/deepseek-ai/deepep.git /tmp/deepep
+        pushd /tmp/deepep && git checkout $DEEPEP_COMMIT
+        CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST="9.0" pip install --no-build-isolation -e .
+        popd
 
         # Disable Nvlink Sharp. The CI machine seems to be in unstable state to support
         # NVLS according to several CI runs.
